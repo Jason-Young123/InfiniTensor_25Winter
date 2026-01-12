@@ -1,0 +1,38 @@
+1. shift + alt + f vscode格式化代码
+2. 本地工作区 ---git add--->  本地暂存区 ---git commit---> 本地仓库 ---git push---> 远程仓库
+git stash push/git stash pop
+
+3. std::size_t 代表size_t类型
+4. const T * var, var指向的对象不可更改,即var[0], var[1]...不可更改
+   T * const var, var指针本身不可更改
+   const T & var, var值不可更改(此时var是数值而非指针)
+5. cpp的struct可以直接用结构体名称,不需要像c一样typedef或者用struct Name
+6. __FILE__对应当前文件名称, __LINE__对应当前行数,常用std::cout << __FILE__ << ":" << __LINE__ << (some var) << std::endl;进行调试
+7. RAII: Resource Acquisition Is Initialization, 对象生命周期 = 资源持有周期(在构造函数获取资源,在析构函数进行资源释放)
+8. inline函数, static函数,带模板template的函数,constexpr限定函数可以被重复定义,即这些函数的定义可以放在.h头文件中
+9. cpp中delete nullptr不会报错,但是重复delete非nullptr会有double free报错
+10. Big 3: 析构函数 + 拷贝构造 + 拷贝赋值
+    Big 5: Big 3 + 移动构造 + 移动赋值
+    Big 0: 在定义不涉及资源管理(即没有动态分配的成员变量)的类时,无需自定义任何特殊成员函数(析构、拷贝构造/赋值、移动构造/赋值),而是让编译器生成默认的
+11. template<typename T>
+    using myType = std::vector<T>;
+    用myType代替某种带模板的type,使用时: myType<T>
+12. auto自动类型推断,不包含const,即const auto需要显式列出
+13. 初始化列表好处:(1)性能提升(2)可以对const类型变量或者引用进行初始化
+14. 抽象类定义:包含至少一个纯虚函数,其不可以被实例化;派生类只有在实现全部纯虚函数之后才可被实例化
+15. cpp引入的新for循环: for(const auto& single_var : iterable_var){ //访问single_var等 }//其中每个single_var都是被迭代变量中的一元,const确保其不会被修改,
+引用避免拷贝的开销;
+    for(auto single_var : iterable_var){ ... } //没有引用,会额外引入拷贝的开销
+    for(auto& single_var: iterable_var){ ... } //有引用但不是const,可以修改每一个single_var
+16. dynamic_cast<Derived *>(var);//动态类型转换,尝试将基类指针指向派生类,如果成功则返回指向派生类的指针,否则返回nullptr
+    static_cast<>();//静态强制类型转换,将派生类指针指向基类(向上转换)总是安全,将基类指针指向派生类(向下转换)时,若调用派生类特有的函数,则可能运行出错
+    reinterpret_cast<>();//
+17. throw std::xx_error{"error message"};如runtime_error,用抛出异常代替std::cerr << "error message" << std::endl;单纯的输出信息
+18. 可以通过std::shared_ptr<T>自动管理内存泄漏,其创建方法为std::make_shared<T>(),获取对象方法为.get()
+    但shared_ptr无法解决循环引用问题,此时需进行Garbage Collection
+
+
+
+
+
+

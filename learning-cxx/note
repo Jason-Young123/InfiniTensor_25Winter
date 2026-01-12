@@ -1,0 +1,328 @@
+PART I
+
+01.i++返回副本(且为递增前),++i返回引用(且为递增后)
+// 1. 前缀递增 ++obj
+    MyClass& operator++() {
+        // 递增逻辑
+        return *this;  // 必须返回引用
+    }
+
+// 2. 后缀递增 obj++
+    MyClass operator++(int) {//int为哑元变量,用于区分前++和后++
+        MyClass temp = *this;  // 保存旧值
+        ++(*this);             // 调用前缀递增
+        return temp;           // 必须返回副本（值）
+    }
+
+
+02.C-based数组初始化:
+int arr[20]{0, 1};等价于int arr[20] = {0, 1};
+
+03.纯函数:函数内部无状态,即不包含static变量等
+
+
+04.C++有这比C更严格的union使用语法(禁止类型双关):
+// C: 允许（可能有实现定义行为）
+union U { float f; int i; } u;
+u.f = 1.0f;
+int x = u.i;  // 通过int读取float的内存
+
+// C++: 未定义行为
+// 替代：
+#include <cstring>
+float f = 1.0f;
+int i;
+std::memcpy(&i, &f, sizeof(f));  //C++安全
+
+// 或C++20：
+#include <bit>
+int i = std::bit_cast<int>(f);  //类型安全
+
+
+05.有关初始化列表和函数体内的初始化:
+DynFibonacci(int capacity): cache(new size_t[capacity]{0, 1}), cached(2) {//放在初始化列表中为全部初始化
+        ASSERT(capacity >= 2, "Invalid Capacity");
+        cache[0] = 0; cache[1] = 1;//只部分初始化
+    }
+
+
+06.有关创建对象:
+ClassName obj(args); - 有参数时总是对象定义
+ClassName obj; - 无参时创建对象(调用默认构造)
+ClassName obj(); - 无参时是函数声明，不是对象(注意不要这样使用)
+ClassName obj{}; - 无参时创建对象(最安全明确)
+
+
+07.&&(右值引用)代表"移动"语义,只可用于右值变量(字面量/临时变量),表明将右值的资源全部"掏空"
+类移动构造函数模板:
+A(A && other) noexcept { ... }
+类移动赋值操作符模板:
+A &operator=(A && other) noexcept { ... }
+注意上述的返回值类型,输入变量类型和noexcept关键字
+
+如果同时实现了移动赋值操作符重载和拷贝赋值操作符重载,则在实际调用时,会根据赋值对象是左值还是右值判断调用哪个,例如:
+A func1(void){...}
+A &func2(void){...}
+
+A a1 = A(), a2 = A();
+a1 = a2;//拷贝赋值,a2为左值
+a1 = A();//移动赋值,A()创建了临时变量,为右值
+a1 = func1();//移动赋值,func1()返回临时变量,为右值
+a1 = func2();//拷贝赋值,func2()返回对象的引用,为左值
+a1 = std::move(a2);//移动赋值,通过std::move将a2转化为右值
+
+std::move(x)含义:将x由左值对象转化为右值引用;如果该语句结果未被使用(例如给y赋值),则x不受影响;
+但如果配合其他操作(如赋值,即y = std::move(x);),则x的资源会被掏空,此后直接访问x是危险行为(除非再给x初始化等)
+
+
+
+08.virtual函数作用:实现运行时动态绑定(多态)
+假设A为基类,B为A的派生类,C为B的派生类,B中定义虚函数vfunc()和非虚函数dfunc(), C中对vfunc()进行override且定义了同名
+非虚函数dfunc(),则:
+A *obj1 = new B();//编译通过,可向上(基类方向)进行类型转换,即派生类指针(引用)可以转换为基类指针(引用)
+obj1->vfunc();//编译失败,A中无vfunc成员函数
+
+A *obj2 = new C();//编译通过
+obj2->vfunc();//编译失败
+
+B *obj3 = new C();//编译通过
+obj3->vfunc();//编译通过,运行时执行C中vfunc(),体现动态绑定性
+obj3->dfunc();//编译通过,运行时执行B中dfunc(),体现静态绑定性
+
+
+即使是动态绑定,基类指针(引用)也无法转换为派生类指针(引用),而是需要dynamic_cast, 例如:
+C *obj4 = obj3;//编译失败,obj3为基类B的指针,无法直接转为派生类C的指针
+C &obj4 = *obj3;//编译失败,基类的引用无法转为派生类的引用
+C *obj4 = dynamic_cast<C *>(obj3);//编译通过
+C &obj4 = dynamic_cast<C &>(*obj3);//编译通过
+
+注意:dynamic_cast转换时需要访问虚函数表,因此必须要实现多态(虚函数)才能成功调用dynamic_cast进行转换;
+	 static_cast转换时则不需要访问虚函数表,因此可直接转换,但是危险(需确保obj3确实指向C类对象)
+
+
+
+09.有关std容器:
+std::array<int, N>:连续存储的数组,常分配在栈上,大小在编译时即固定,后续不可更改
+std::vector<int>:连续存储的数组,数组信息分配在栈上,数据本身分配在堆上,容量运行时动态更改
+
+二者常用方法:
+var.data()//返回第一个元素地址
+var.begin()//返回第一个元素地址,但是类型是iterator
+var.end()//返回最后一个元素地址的下一个地址
+var.size()
+var.capacity()(仅vector)
+var.push_back()//从尾部插入元素
+var.pop_back()//从尾部弹出元素
+
+注意,sizeof(std::array<int, N> a) = N * sizeof(int)
+但是sizeof(std::vector<int> a) = 24(在64位系统上为3个指针,包含数组信息)
+(特殊:std::vector<bool>)
+
+std::vector<bool>的特殊之处:
+std::vector<int> a(10, 1);
+auto aa = a[5];  // 等价于: int aa = a[5];
+                 // a[5]返回int&，但auto进行值拷贝
+                 // aa是独立的int变量
+aa = 2;          // 只修改aa，不影响a[5]
+
+std::vector<bool> b(10, true);
+auto bb = b[5];  // 等价于: std::vector<bool>::reference bb = b[5];
+				 // b[5]返回std::vector<bool>::reference
+                 // 注意：这不是值拷贝！这是代理对象的拷贝
+                 // bb仍然关联到b[5]的bit
+bb = false;      // 通过代理对象修改了b[5]的bit
+bool bbb = b[6]; bbb = false;//此时就是值拷贝,不影响b[6]
+
+
+std::vector<int> a(10);//创建有地址、size = 10、capacity = 10的数组,元素均初始化为0
+std::vector<int> a(10, 2);//......元素均初始化为2
+a.push_back(1);//a.size = 11, a.capacity = 20,注意其数据地址可能已经改变
+std::vector<int> b;//创建无地址(nullptr)、size = 0、capacity = 0的数组
+b.push_back(1);//b.size = 1, b.capacity = 1,为数据分配地址
+std::vector<int> c;
+c.reserve(10);//reserve后c有地址、size = 0、capacity = 10
+c.push_back(1);//c.size = 1, c.capacity = 10,地址不变
+总结:当size = capacity,再进行push_back后数据地址会发生改变
+
+有关容器的move:
+std::vector<int> v1{1,2};
+std::vector<int> v2{3,4};
+v2 = std::move(v1);//执行时,首先将v2原本的资源进行释放,然后"接管"v1的全部资源,即v2.data()指向v1.data(),
+size, capacity等信息均改为v1的信息,最后将v1.data()地址指针置为nullptr, size, capacity等均置为0;
+总体而言,在被move之后,v2回到了仅被定义而未被初始化的状态(std::vector<int> v2;)
+
+
+
+10.for(int i = 0, char j = 'a'; xxxx; xxxx)错误,因为for语句中不允许局部定义两个类别不同的变量
+auto用于自动推到类型,但不可用于C-based的数组(std::array/vector等容器可以);可以用decltype代替:
+decltype(a) arr[] = {a, a, a};//或初始化简化为arr[]{a, a, a};
+
+
+
+11.有关std的智能指针:
+
+
+
+
+
+
+
+-------------------------------------------------------------------------------------------------------------
+
+
+
+PART II:
+
+1. constexpr const int func(const int a) const{ ... } 每个const含义:
+(1)constexpr: 表示在编译期间可以完成求值
+(2)第一个const: 表示函数返回常量(可忽略)
+(3)第二个const: 函数内不可更改a
+(4)第三个const: 不会更改成员变量
+
+传入引用的好处是可以避免副本的复制开销;返回引用的好处是可以直接作为左值(尤其在某些操作符重载函数中)
+
+2.delete NULL在cpp中是合法操作
+
+3.&&代表对右值(无地址的字面量/临时对象)的引用,无法接受左值或const变量;如果确实为左值则需要调用std::move()方法转化为右值
+&&常用于移动构造器和移动赋值操作符重载函数中,等价于浅拷贝,并且将other的成员都清零(但不释放资源)
+移动构造的一个典型实现如下:
+A(A && other) noexcept {
+	this -> x = other.x;
+	this -> y = other.y;
+	other.x = nullptr;//如果是指针
+	other.y = 0;//如果是值
+}
+移动赋值的一个典型实现如下:
+A &operator=(A && other) noexcept {
+	if(&other != this){//注意是&other,地址,与this指针对应
+		delete[] this -> x;//相较移动构造要额外释放本来已有的资源
+		this -> y = 0;
+		this -> x = other.x;
+		this -> y = other.y;
+		other.x = nullptr;
+		other.y = 0;
+	}
+}
+
+在外部调用时:
+A a1();
+A a2 = std::move(a1);//采用std::move方法,用左值变量a1去移动构造a2
+A a3 = a_tmp();//采用字面量,用右值变量a_tmp去移动构造a3
+
+
+4.C++的三/五原则:
+对于C++98及之前版本的三法则: 析构函数、拷贝构造函数、拷贝赋值运算符,实现其一则必须实现全部三个
+对于C++11及之后版本的五法则: 析构函数、拷贝构造函数、拷贝赋值运算符、移动构造函数、移动赋值运算符,实现其一则必须实现全部五个
+
+
+5.计算struct/class大小时,只需计算成员变量(需考虑继承)即可,成员函数/构造函数/析构函数不计入
+
+
+6.struct和class的区别在于struct的成员访问和继承方式默认为public,而class默认为private
+
+7.override明确表明是对基类虚函数的覆盖,如果函数名/参数列表/返回值不匹配编译器会报错;
+final明确表明这是最终版本,任何派生类不允许再对该虚函数进行覆盖;
+override final兼具上述两种含义;
+理论上不加override在函数名+参数列表+返回值完全一致时等价于override,但编译器不会进行检查,因此可能导致定义了一个同名的新函数而覆盖失败
+(特例:析构函数,可以不同名)
+
+8.全局变量可以不初始化,默认为0;
+函数内局部变量可以不初始化(会有警告),默认为随机值;
+全局/局部静态变量可以不初始化,默认为0;
+类静态成员只是声明,必须要在类外进行定义(如int A::a = 0;(不需要static关键字,因为类内部声明时已经有static));
+定义时也可以不初始化,默认为0
+
+
+9.为何析构函数总是虚函数?
+确保在析构派生类时也调用基类的析构函数,从而完成对基类资源的释放
+
+10.C++默认为行优先存储,对于形状为[A, B, C, D]的张量,index = [a, b, c, d]的元素内存偏移量为:
+offset = a * (BCD) + b * (CD) + c * (D) + d
+也可以如此计算:
+offset = (((0*A + a)*B + b)*C + c)*D + d,令offset初始化 = 0然后循环完成计算
+
+
+11.std::array和std::vector对比:
+
+std::array:分配在栈上,sizeof(arr) = arr.size() * sizeof(int)
+栈内存
+┌─────────────────────┐ ← arr（sizeof(arr)=20）
+│ 元素0: int (1)      │
+│ 元素1: int (2)      │
+│ 元素2: int (3)      │ ← arr[2] 直接在这里
+│ 元素3: int (4)      │
+│ 元素4: int (5)      │
+└─────────────────────┘
+arr.size() = 5
+
+std::vector:相关信息分配在栈上,原始数据分配在堆上
+栈内存
+┌─────────────────────┐ ← vec（sizeof(vec)=24）
+│ _M_start → 元素0    │
+│ _M_finish -> 元素5后│
+│ _M_EOS->内存分配末尾│
+└─────────────────────┘
+    ↓
+堆内存
+┌─────────────────────┐
+│ 元素0: int (1)      │ ← vec[0]
+│ 元素1: int (2)      │
+│ 元素2: int (3)      │
+│ 元素3: int (4)      │
+│ 元素4: int (5)      │
+│ ...可能还有空闲空间...│
+└─────────────────────┘
+vec.size() = 5
+
+12.std::is_same_v<T1, T2>,判断T1和T2是否为同一类型(包含const和引用判断)
+"xxx"s带s后缀默认为std::string,而不带s后缀"xxx"默认为const char *
+decltype获取变量/字面量的类型
+
+13.两种容器预分配空间方案:
+std::vector<int> myvec(10);
+
+std::vector<int> myvec; 
+myvec.reserve(10);
+
+若未预分配空间,可通过push_back自动动态分配空间;
+
+
+14.除了迭代器,std::string也可以使用push_back('x')向尾部添加<一个>字符
+
+
+15.std::vector<int> a; ->创建vector对象a,a具有数组含义
+std::vector<int> a(10); -> a容量为10
+std::vector<int> a(10, 1); -> a容量为10且初始值为1
+
+std::vector<int> a[]; -> 创建包含若干vector对象的数组a,a[i]具有数组含义,a具有数组的数组含义
+std::vector<int> a1{1,2,3};
+std::vector<int> a2{1,2};
+std::vector<int> a3{1};
+std::vector<int> a[]{a1, a2, a3}; -> 带初始化,a1-a3都已提前定义,且为复制构造
+
+
+16.std::transform用法:
+std::transform(src.begin(), src.end(), dst.begin(), function_ptr)
+(1)若dst.begin() == src.begin(),则在原本数据上进行覆盖
+(2)若dst未预分配空间,则dst.begin()需改为std::back_inserter(dst)
+(3)function_ptr可以为lambda匿名函数,用法为: [capture list](param list){ function definition }
+		# capture list代表lambda函数能捕捉外部哪些变量、以哪种方式捕捉(引用/副本)
+		# param list为参数列表
+		# function definition为函数体
+
+
+17.std::accumulate用法:
+std::accumulate(src.begin(), src.end(), init_value, operator)
+(1)若待操作数据为数组而非std::vector等容器,则src.begin()/src.end()需改为std::begin()/std::end()
+(2)init_value为accumulator的初始值,例如对于累加操作通常取0,对于累乘操作通常取1,对于字符串拼接任务则取""
+(3)operator为运算类型,缺省默认为"+"(即std::add<T>()但对于不同数据类型含义不同),累乘时可以用std::multiplies<T>()
+这里T改为需进行accumulate的数据类型,可以为自定义类型
+
+
+
+
+
+
+
+
+

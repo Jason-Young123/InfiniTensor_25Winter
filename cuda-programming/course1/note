@@ -1,0 +1,43 @@
+1. 串行, 并发(轮询式工作,每个时间点仍只有一个对象被服务), 并行(多硬件,真并行,每个时间点有多个对象被服务)
+2. cpu并行:少量复杂核心(强调全能), GPU并行:大量简化核心(强调简单,高并行,高吞吐)
+3. cuda编程特点: (1)宿主语言为C/CPP 
+                (2)需要和CPU端协作
+                (3)SIMT, Single Instruction Multiple Threads模式
+                (4)根据设定参数自动调度资源(优化)
+4. GPU组成: SM-Streaming Multi-processor
+            CUDA core:完成通用计算
+            CPU的RAM <-> GPU的Global Memory
+
+5. 编译运行流程: (1)CPU准备
+                (2)CPU传数据至GPU
+                (3)GPU从GM读取,计算并写回(定义block数量和大小,定义GPU上的运算函数)
+                (4)GPU传数据至CPU
+                (5)验证结果
+6. Grid -> Block(CTA) -> Thread
+   线程编号: idx = block_id * block_size + thread_id(in per block)
+   即: int idx = blockIdx.x * blockDim.x + threadIdx.x
+   dim3 block_dim(256);//代表每个block包含256个thread
+   dim3 grid_dim(256);//代表每个grid包含256个block
+7. CUDA-GDB:
+      -g: 生成cpu端调试信息
+      -G: 生成GPU端调试信息
+      nvcc -g -G -o prog prog.cu
+      cuda-gdb
+      file prog: 导入程序
+      r: 直接运行结束
+      start: 开始运行并停留在main函数
+      next(n): 逐行运行
+      until k: 运行直到k行 
+      break(b) k: 在k行打断点
+      break(b) func: 在函数func处打断点
+      print(p) a: 打印变量a
+      info cuda threads
+      cuda thread/block k: 转移focus至第k个线程
+
+      回车: 重复运行上一条命令
+
+8. device端无法使用cpp库,如STL容器
+      
+
+
+
