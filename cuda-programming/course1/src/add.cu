@@ -140,8 +140,20 @@ int main(){
     // std::cout << "Grid-Stride time: " << time2 << " ms" << std::endl;
     // std::cout << "Cpu time: " << time3 << " ms" << std::endl; 
 
+
+    //为了nsys特意添加
+    //立刻检查 launch 是否成功
+    CUDA_CHECK(cudaGetLastError());
+    //明确等 kernel 执行完成
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+
     //step4: copy from device to host
     CUDA_CHECK(cudaMemcpy(host_c.data(), device_c, size_bytes, cudaMemcpyDeviceToHost));
+
+
+    //sync
+    //CUDA_CHECK(cudaDeviceSynchronize());
 
     //step5: free memory
     if(device_a)
@@ -150,6 +162,9 @@ int main(){
         CUDA_CHECK(cudaFree(device_b));
     if(device_c)
         CUDA_CHECK(cudaFree(device_c)); 
+
+
+    CUDA_CHECK(cudaDeviceReset());
 
     return 0;
 }

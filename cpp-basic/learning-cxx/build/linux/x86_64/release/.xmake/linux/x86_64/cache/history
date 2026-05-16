@@ -1,0 +1,11 @@
+{
+    cmdlines = {
+        "xmake run -P /home/jason/InfiniTensor/learning-cxx/exercises exercise01",
+        "xmake -P /home/jason/InfiniTensor_25Winter/learning-cxx/exercises exercise00",
+        "xmake run -P /home/jason/InfiniTensor_25Winter/learning-cxx/exercises exercise00",
+        "xmake -P /home/jason/InfiniTensor_25Winter/cpp-basic/learning-cxx/exercises exercise01",
+        "xmake run -P /home/jason/InfiniTensor_25Winter/cpp-basic/learning-cxx/exercises exercise01",
+        "xmake -P /home/jason/InfiniTensor_25Winter/cpp-basic/learning-cxx/exercises exercise00",
+        "xmake run -P /home/jason/InfiniTensor_25Winter/cpp-basic/learning-cxx/exercises exercise00"
+    }
+}

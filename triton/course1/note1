@@ -1,0 +1,27 @@
+1. Triton: DSL, Domain Specific Language,专门用于实现高性能计算内核
+	非通用编程语言;
+	语法基于Python;
+
+    底层并行编程语言往往比较复杂,如cuda C++,而triton则更简洁、通用性更强,且性能更好;
+    编写triton时只需考虑SM之间的调度,无需考虑SM内或共享内存调度
+
+对于cuda cpp:
+    线程层次: thread -> block -> cluster -> grid
+    memory层次: register -> local memory -> shared memory -> global memory -> constant memory -> texture memory...
+
+对于triton:
+    triton.language.program_id
+    triton.language.arange
+    triton.language.load
+    triton.language.store
+
+2.triton API:
+    import triton.language as tl
+    
+    (1)tl.program_id(axis):返回当前维度(0/1/2)的program instance编号;建立并行实例和任务间的关系
+    (2)tl.arange(start, end):生成[start, end)的向量
+    (3)tl.load/tl.store:数据读取,参数主要关注pointer, value, mask
+
+版本3.2.0
+
+
