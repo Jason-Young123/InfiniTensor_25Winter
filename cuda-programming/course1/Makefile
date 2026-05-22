@@ -12,10 +12,12 @@ NSYS = /usr/local/cuda-12.8/bin/nsys
 TARGET = default
 SRC = $(SRC_DIR)/$(TARGET).cu
 EXEC = $(OBJ_DIR)/$(TARGET)
+LDFLAGS += -lcublas
 #CXXFLAGS += -g -G
+#CXXFLAGS += -arch=sm_120
 
 $(EXEC): $(SRC)
-	@$(CXX) $(CXXFLAGS) -o $@ $<
+	@$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<
 
 run: $(EXEC)
 	@./$<
