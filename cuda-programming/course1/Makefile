@@ -14,7 +14,9 @@ SRC = $(SRC_DIR)/$(TARGET).cu
 EXEC = $(OBJ_DIR)/$(TARGET)
 LDFLAGS += -lcublas
 #CXXFLAGS += -g -G
-#CXXFLAGS += -arch=sm_120
+CXXFLAGS += -arch=sm_120
+CXXFLAGS += -Xptxas -v
+
 
 $(EXEC): $(SRC)
 	@$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $<

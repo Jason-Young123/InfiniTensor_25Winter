@@ -54,6 +54,47 @@ __device__ __forceinline__ void cooperative_ldst(
 }
 
 
+//辅助函数: 带列方向padding的协同加载/存储; shared memory物理列数为COL + PAD, 逻辑搬运范围仍为ROW x COL
+template <typename T, int TROW, int TCOL, int ROW, int COL, int PAD, bool direction>
+__device__ __forceinline__ void cooperative_ldst(
+    T* dst,
+    const T* src,
+    int start_row,
+    int start_col,
+    int max_rows,
+    int max_cols
+) {
+    int flat_tid = threadIdx.y * blockDim.x + threadIdx.x;
+    
+    const int num_threads = TROW * TCOL;
+    const int num_elements = ROW * COL;
+    const int SMEM_COL = COL + PAD;
+
+    #pragma unroll
+    for (int i = flat_tid; i < num_elements; i += num_threads) {
+        int smem_row = i / COL;
+        int smem_col = i % COL;
+        int smem_offset = smem_row * SMEM_COL + smem_col;
+
+        int gm_row = start_row + smem_row;
+        int gm_col = start_col + smem_col;
+
+        if (gm_row < max_rows && gm_col < max_cols) {
+            if(direction){
+                dst[gm_row * max_cols + gm_col] = src[smem_offset];
+            }
+            else{
+                dst[smem_offset] = src[gm_row * max_cols + gm_col];
+            }
+        } else {
+            if(!direction){
+                dst[smem_offset] = T(0);
+            }
+        }
+    }
+}
+
+
 
 
 //naive, 仅确保无bank conflict, 但没有使用shared memory
@@ -92,7 +133,7 @@ __global__ void matmul2(T* C, const T* A, const T* B, const int M, const int K, 
     int idy = blockIdx.y * blockDim.y + threadIdx.y;
 
     //设置32x32的shared memory tile
-    const int TILE_M = 16;//即blockDim.y
+    const int TILE_M = 32;//即blockDim.y
     const int TILE_N = 32;//即blockDim.x
     const int TILE_K = 32;//K方向上分块
     __shared__ T A_tile [TILE_M][TILE_K];
@@ -298,6 +339,274 @@ __global__ void matmul4(T* C, const T* A, const T* B, const int M, const int K, 
 }
 
 
+//按照Block Tile -> Warp Tile -> Thread Tile层级划分, 每个thread负责一个连续8x8的C子块
+template <typename T>
+__global__ void matmul5(T* C, const T* A, const T* B, const int M, const int K, const int N){
+    const int BLOCK_THREAD_M = 8;//blockDim.y
+    const int BLOCK_THREAD_N = 32;//blockDim.x
+
+    const int TILE_M = 64;//block tile M
+    const int TILE_N = 64;//block tile N
+    const int TILE_K = 8;//K方向上分块
+
+    const int TILE_WARP_M = 32;//warp tile M
+    const int TILE_WARP_N = 16;//warp tile N
+
+    const int TILE_THREAD_M = 4;//thread tile M
+    const int TILE_THREAD_N = 4;//thread tile N
+
+    const int WARPS_M = TILE_M / TILE_WARP_M;//2
+    const int WARPS_N = TILE_N / TILE_WARP_N;//2
+    const int WARP_THREADS_M = TILE_WARP_M / TILE_THREAD_M;//8
+    const int WARP_THREADS_N = TILE_WARP_N / TILE_THREAD_N;//4
+
+    __shared__ T A_tile [TILE_M][TILE_K];
+    __shared__ T B_tile [TILE_K][TILE_N];
+
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    int warp_m = warp_id / WARPS_N;
+    int warp_n = warp_id % WARPS_N;
+
+    int lane_m = lane_id / WARP_THREADS_N;
+    int lane_n = lane_id % WARP_THREADS_N;
+
+    int thread_tile_row = warp_m * TILE_WARP_M + lane_m * TILE_THREAD_M;
+    int thread_tile_col = warp_n * TILE_WARP_N + lane_n * TILE_THREAD_N;
+
+    T A_reg[TILE_THREAD_M];
+    T B_reg[TILE_THREAD_N];
+    T thread_accum[TILE_THREAD_M][TILE_THREAD_N] = {T(0)};
+
+    for(int i = 0; i < K; i += TILE_K){
+        cooperative_ldst<T, BLOCK_THREAD_M, BLOCK_THREAD_N, TILE_M, TILE_K, 0>((T*)A_tile, A, blockIdx.y * TILE_M, i, M, K);
+        cooperative_ldst<T, BLOCK_THREAD_M, BLOCK_THREAD_N, TILE_K, TILE_N, 0>((T*)B_tile, B, i, blockIdx.x * TILE_N, K, N);
+        __syncthreads();
+
+        for(int k = 0; k < TILE_K; ++k){
+            for(int m = 0; m < TILE_THREAD_M; ++m){
+                A_reg[m] = A_tile[thread_tile_row + m][k];
+            }
+            for(int n = 0; n < TILE_THREAD_N; ++n){
+                B_reg[n] = B_tile[k][thread_tile_col + n];
+            }
+            for(int m = 0; m < TILE_THREAD_M; ++m){
+                for(int n = 0; n < TILE_THREAD_N; ++n){
+                    thread_accum[m][n] += A_reg[m] * B_reg[n];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    /*for(int m = 0; m < TILE_THREAD_M; ++m){
+        for(int n = 0; n < TILE_THREAD_N; ++n){
+            int gm_row = blockIdx.y * TILE_M + thread_tile_row + m;
+            int gm_col = blockIdx.x * TILE_N + thread_tile_col + n;
+            if(gm_row < M && gm_col < N){
+                C[gm_row * N + gm_col] = thread_accum[m][n];
+            }
+        }
+    }*/
+    //写回直接特化为4次float4;由于原矩阵尺寸为4的倍数因而可以直接这么写,但是如果存在边界情况则需要分类
+    int gm_row0 = blockIdx.y * TILE_M + thread_tile_row + 0;
+    int gm_row1 = blockIdx.y * TILE_M + thread_tile_row + 1;
+    int gm_row2 = blockIdx.y * TILE_M + thread_tile_row + 2;
+    int gm_row3 = blockIdx.y * TILE_M + thread_tile_row + 3;
+    int gm_col = blockIdx.x * TILE_N + thread_tile_col + 0;
+    float4 row0 = make_float4(float(thread_accum[0][0]), float(thread_accum[0][1]), float(thread_accum[0][2]), float(thread_accum[0][3]));
+    float4 row1 = make_float4(float(thread_accum[1][0]), float(thread_accum[1][1]), float(thread_accum[1][2]), float(thread_accum[1][3]));
+    float4 row2 = make_float4(float(thread_accum[2][0]), float(thread_accum[2][1]), float(thread_accum[2][2]), float(thread_accum[2][3]));
+    float4 row3 = make_float4(float(thread_accum[3][0]), float(thread_accum[3][1]), float(thread_accum[3][2]), float(thread_accum[3][3]));
+    *reinterpret_cast<float4*>(&C[gm_row0 * N + gm_col]) = row0;
+    *reinterpret_cast<float4*>(&C[gm_row1 * N + gm_col]) = row1;
+    *reinterpret_cast<float4*>(&C[gm_row2 * N + gm_col]) = row2;
+    *reinterpret_cast<float4*>(&C[gm_row3 * N + gm_col]) = row3;
+
+}
+
+
+//在matmul5基础上给A_tile的K维末尾添加padding, 使A_tile计算阶段读访问的bank被打散
+template <typename T>
+__global__ void matmul7(T* C, const T* A, const T* B, const int M, const int K, const int N){
+    const int BLOCK_THREAD_M = 8;//blockDim.y
+    const int BLOCK_THREAD_N = 32;//blockDim.x
+
+    const int TILE_M = 64;//block tile M
+    const int TILE_N = 64;//block tile N
+    const int TILE_K = 8;//K方向上分块
+    const int A_PAD = 1;//A_tile物理列数为TILE_K + A_PAD, 用于消除A_tile读阶段bank conflict
+
+    const int TILE_WARP_M = 32;//warp tile M
+    const int TILE_WARP_N = 16;//warp tile N
+
+    const int TILE_THREAD_M = 4;//thread tile M
+    const int TILE_THREAD_N = 4;//thread tile N
+
+    const int WARPS_M = TILE_M / TILE_WARP_M;
+    const int WARPS_N = TILE_N / TILE_WARP_N;
+    const int WARP_THREADS_M = TILE_WARP_M / TILE_THREAD_M;
+    const int WARP_THREADS_N = TILE_WARP_N / TILE_THREAD_N;
+
+    __shared__ T A_tile [TILE_M][TILE_K + A_PAD];
+    __shared__ T B_tile [TILE_K][TILE_N];
+
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    int warp_m = warp_id / WARPS_N;
+    int warp_n = warp_id % WARPS_N;
+
+    int lane_m = lane_id / WARP_THREADS_N;
+    int lane_n = lane_id % WARP_THREADS_N;
+
+    int thread_tile_row = warp_m * TILE_WARP_M + lane_m * TILE_THREAD_M;
+    int thread_tile_col = warp_n * TILE_WARP_N + lane_n * TILE_THREAD_N;
+
+    T A_reg[TILE_THREAD_M];
+    T B_reg[TILE_THREAD_N];
+    T thread_accum[TILE_THREAD_M][TILE_THREAD_N] = {T(0)};
+
+    for(int i = 0; i < K; i += TILE_K){
+        cooperative_ldst<T, BLOCK_THREAD_M, BLOCK_THREAD_N, TILE_M, TILE_K, A_PAD, 0>((T*)A_tile, A, blockIdx.y * TILE_M, i, M, K);
+        cooperative_ldst<T, BLOCK_THREAD_M, BLOCK_THREAD_N, TILE_K, TILE_N, 0>((T*)B_tile, B, i, blockIdx.x * TILE_N, K, N);
+        __syncthreads();
+
+        for(int k = 0; k < TILE_K; ++k){
+            for(int m = 0; m < TILE_THREAD_M; ++m){
+                A_reg[m] = A_tile[thread_tile_row + m][k];
+            }
+            for(int n = 0; n < TILE_THREAD_N; ++n){
+                B_reg[n] = B_tile[k][thread_tile_col + n];
+            }
+            for(int m = 0; m < TILE_THREAD_M; ++m){
+                for(int n = 0; n < TILE_THREAD_N; ++n){
+                    thread_accum[m][n] += A_reg[m] * B_reg[n];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    int gm_row0 = blockIdx.y * TILE_M + thread_tile_row + 0;
+    int gm_row1 = blockIdx.y * TILE_M + thread_tile_row + 1;
+    int gm_row2 = blockIdx.y * TILE_M + thread_tile_row + 2;
+    int gm_row3 = blockIdx.y * TILE_M + thread_tile_row + 3;
+    int gm_col = blockIdx.x * TILE_N + thread_tile_col + 0;
+    float4 row0 = make_float4(float(thread_accum[0][0]), float(thread_accum[0][1]), float(thread_accum[0][2]), float(thread_accum[0][3]));
+    float4 row1 = make_float4(float(thread_accum[1][0]), float(thread_accum[1][1]), float(thread_accum[1][2]), float(thread_accum[1][3]));
+    float4 row2 = make_float4(float(thread_accum[2][0]), float(thread_accum[2][1]), float(thread_accum[2][2]), float(thread_accum[2][3]));
+    float4 row3 = make_float4(float(thread_accum[3][0]), float(thread_accum[3][1]), float(thread_accum[3][2]), float(thread_accum[3][3]));
+    *reinterpret_cast<float4*>(&C[gm_row0 * N + gm_col]) = row0;
+    *reinterpret_cast<float4*>(&C[gm_row1 * N + gm_col]) = row1;
+    *reinterpret_cast<float4*>(&C[gm_row2 * N + gm_col]) = row2;
+    *reinterpret_cast<float4*>(&C[gm_row3 * N + gm_col]) = row3;
+}
+
+
+//按照图中的Thread Tile布局, 每个thread负责4个跳步后的4x4 C子块
+template <typename T>
+__global__ void matmul6(T* C, const T* A, const T* B, const int M, const int K, const int N){
+    const int BLOCK_THREAD_M = 8;//blockDim.y
+    const int BLOCK_THREAD_N = 32;//blockDim.x
+
+    const int TILE_M = 128;//block tile M
+    const int TILE_N = 128;//block tile N
+    const int TILE_K = 8;//K方向上分块
+
+    const int TILE_WARP_M = 64;//warp tile M
+    const int TILE_WARP_N = 32;//warp tile N
+
+    const int TILE_THREAD_M = 4;//每个小thread tile的M方向大小
+    const int TILE_THREAD_N = 4;//每个小thread tile的N方向大小
+    const int THREAD_TILES_M = 2;//上下两个4x4
+    const int THREAD_TILES_N = 2;//左右两个4x4
+
+    const int WARPS_M = TILE_M / TILE_WARP_M;
+    const int WARPS_N = TILE_N / TILE_WARP_N;
+    const int WARP_THREADS_M = TILE_WARP_M / (TILE_THREAD_M * THREAD_TILES_M);
+    const int WARP_THREADS_N = TILE_WARP_N / (TILE_THREAD_N * THREAD_TILES_N);
+    const int THREAD_TILE_ROW_STRIDE = WARP_THREADS_M * TILE_THREAD_M;
+    const int THREAD_TILE_COL_STRIDE = WARP_THREADS_N * TILE_THREAD_N;
+
+    /*static_assert(TILE_M % TILE_WARP_M == 0, "TILE_M must be divisible by TILE_WARP_M");
+    static_assert(TILE_N % TILE_WARP_N == 0, "TILE_N must be divisible by TILE_WARP_N");
+    static_assert(TILE_WARP_M % (TILE_THREAD_M * THREAD_TILES_M) == 0, "TILE_WARP_M must match thread tile layout");
+    static_assert(TILE_WARP_N % (TILE_THREAD_N * THREAD_TILES_N) == 0, "TILE_WARP_N must match thread tile layout");
+    static_assert(WARP_THREADS_M * WARP_THREADS_N == 32, "one warp tile must be covered by 32 threads");
+    static_assert(WARPS_M * WARPS_N * 32 == BLOCK_THREAD_M * BLOCK_THREAD_N, "block tile must match block thread count");
+    */
+
+    __shared__ T A_tile [TILE_M][TILE_K];
+    __shared__ T B_tile [TILE_K][TILE_N];
+
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    int warp_m = warp_id / WARPS_N;
+    int warp_n = warp_id % WARPS_N;
+
+    int lane_m = lane_id / WARP_THREADS_N;
+    int lane_n = lane_id % WARP_THREADS_N;
+
+    int thread_tile_row = warp_m * TILE_WARP_M + lane_m * TILE_THREAD_M;
+    int thread_tile_col = warp_n * TILE_WARP_N + lane_n * TILE_THREAD_N;
+
+    T A_reg[THREAD_TILES_M][TILE_THREAD_M];
+    T B_reg[THREAD_TILES_N][TILE_THREAD_N];
+    T thread_accum[THREAD_TILES_M][THREAD_TILES_N][TILE_THREAD_M][TILE_THREAD_N] = {T(0)};
+
+    for(int i = 0; i < K; i += TILE_K){
+        cooperative_ldst<T, BLOCK_THREAD_M, BLOCK_THREAD_N, TILE_M, TILE_K, 0>((T*)A_tile, A, blockIdx.y * TILE_M, i, M, K);
+        cooperative_ldst<T, BLOCK_THREAD_M, BLOCK_THREAD_N, TILE_K, TILE_N, 0>((T*)B_tile, B, i, blockIdx.x * TILE_N, K, N);
+        __syncthreads();
+
+        for(int k = 0; k < TILE_K; ++k){
+            for(int tm = 0; tm < THREAD_TILES_M; ++tm){
+                for(int m = 0; m < TILE_THREAD_M; ++m){
+                    A_reg[tm][m] = A_tile[thread_tile_row + tm * THREAD_TILE_ROW_STRIDE + m][k];
+                }
+            }
+            for(int tn = 0; tn < THREAD_TILES_N; ++tn){
+                for(int n = 0; n < TILE_THREAD_N; ++n){
+                    B_reg[tn][n] = B_tile[k][thread_tile_col + tn * THREAD_TILE_COL_STRIDE + n];
+                }
+            }
+            for(int tm = 0; tm < THREAD_TILES_M; ++tm){
+                for(int tn = 0; tn < THREAD_TILES_N; ++tn){
+                    for(int m = 0; m < TILE_THREAD_M; ++m){
+                        for(int n = 0; n < TILE_THREAD_N; ++n){
+                            thread_accum[tm][tn][m][n] += A_reg[tm][m] * B_reg[tn][n];
+                        }
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    for(int tm = 0; tm < THREAD_TILES_M; ++tm){
+        for(int tn = 0; tn < THREAD_TILES_N; ++tn){
+            for(int m = 0; m < TILE_THREAD_M; ++m){
+                for(int n = 0; n < TILE_THREAD_N; ++n){
+                    int gm_row = blockIdx.y * TILE_M + thread_tile_row + tm * THREAD_TILE_ROW_STRIDE + m;
+                    int gm_col = blockIdx.x * TILE_N + thread_tile_col + tn * THREAD_TILE_COL_STRIDE + n;
+                    if(gm_row < M && gm_col < N){
+                        C[gm_row * N + gm_col] = thread_accum[tm][tn][m][n];
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 
 
@@ -350,7 +659,7 @@ void matmul_cublas(float* C, const float* A, const float* B, const int M, const 
 
 
 int main(){
-    int M = 2048, K = 1024, N = 4096;
+    int M = 1024, K = 1024, N = 1024;
 
     float *h_A = new float[M * K];
     float *h_B = new float[K * N];
@@ -380,24 +689,30 @@ int main(){
     //step3: launch kernel
     dim3 block_dim1(32, 32);
     dim3 grid_dim1((N + 31)/32, (M + 31)/32);
-    dim3 block_dim2(32, 16);
-    dim3 grid_dim2((N + 31)/32, (M + 15)/16);
+    dim3 block_dim2(32, 32);
+    dim3 grid_dim2((N + 31)/32, (M + 31)/32);
     dim3 block_dim3(32, 8);
     dim3 grid_dim3((N + 127)/128, (M + 31)/32);
-    matmul1<float><<<grid_dim1, block_dim1>>>(d_C, d_A, d_B, M, K, N);
+    dim3 block_dim5(32, 8);
+    dim3 grid_dim5((N + 63)/64, (M + 63)/64);
+    dim3 block_dim6(16, 16);
+    dim3 grid_dim6((N + 127)/128, (M + 127)/128);
+
+    
+    /*matmul1<float><<<grid_dim1, block_dim1>>>(d_C, d_A, d_B, M, K, N);
     cudaDeviceSynchronize(); 
     cudaError_t err1 = cudaGetLastError();
     if (err1 != cudaSuccess) {
         std::cerr << "Kernel failed: " << cudaGetErrorString(err1) << std::endl;
-    }
+    }*/
 
 
-    matmul2<float><<<grid_dim2, block_dim2>>>(d_C, d_A, d_B, M, K, N);
+    /*matmul2<float><<<grid_dim2, block_dim2>>>(d_C, d_A, d_B, M, K, N);
     cudaDeviceSynchronize(); 
     cudaError_t err2 = cudaGetLastError();
     if (err2 != cudaSuccess) {
         std::cerr << "Kernel failed: " << cudaGetErrorString(err2) << std::endl;
-    }
+    }*/
 
     matmul3<float><<<grid_dim3, block_dim3>>>(d_C, d_A, d_B, M, K, N);
     cudaDeviceSynchronize(); 
@@ -414,6 +729,20 @@ int main(){
         std::cerr << "Kernel failed: " << cudaGetErrorString(err4) << std::endl;
     }*/
 
+    matmul7<float><<<grid_dim5, block_dim5>>>(d_C, d_A, d_B, M, K, N);
+    cudaDeviceSynchronize(); 
+    cudaError_t err5 = cudaGetLastError();
+    if (err5 != cudaSuccess) {
+        std::cerr << "Kernel failed: " << cudaGetErrorString(err5) << std::endl;
+    }
+
+
+    /*matmul6<float><<<grid_dim6, block_dim6>>>(d_C, d_A, d_B, M, K, N);
+    cudaDeviceSynchronize(); 
+    cudaError_t err6 = cudaGetLastError();
+    if (err6 != cudaSuccess) {
+        std::cerr << "Kernel failed: " << cudaGetErrorString(err6) << std::endl;
+    }*/
 
 
     //cublas对照
@@ -426,6 +755,7 @@ int main(){
         std::cerr << "Kernel failed: " << cudaGetErrorString(err_cublas) << std::endl;
     }
     cublasDestroy(handle);
+    
 
 
 
@@ -446,7 +776,3 @@ int main(){
 
     return 0;
 }
-
-
-
-
