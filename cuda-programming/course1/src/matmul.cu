@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <random>
 #include <cublas_v2.h>
+#include <mma.h>
 
 
 #define LOAD 0
@@ -97,6 +98,128 @@ __device__ __forceinline__ void cooperative_ldst(
 
 
 
+//辅助函数: float4向量化协同加载; 逻辑搬运范围为ROW x COL个float, 且COL必须为4的倍数
+template <int TROW, int TCOL, int ROW, int COL, bool direction>
+__device__ __forceinline__ void cooperative_ldst_vector(
+    float* dst,
+    const float* src,
+    int start_row,
+    int start_col,
+    int max_rows,
+    int max_cols
+) {
+    int flat_tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+    const int num_threads = TROW * TCOL;
+    const int vec_cols = COL / 4;
+    const int num_vec_elements = ROW * vec_cols;
+
+    for(int i = flat_tid; i < num_vec_elements; i += num_threads){
+        int smem_row = i / vec_cols;
+        int smem_vec_col = i % vec_cols;
+        int smem_col = smem_vec_col * 4;
+        int smem_offset = smem_row * COL + smem_col;
+
+        int gm_row = start_row + smem_row;
+        int gm_col = start_col + smem_col;
+
+        if(direction){
+
+        }
+        else{
+            if(gm_row < max_rows && gm_col + 3 < max_cols && gm_col % 4 == 0){
+                float4 value = *reinterpret_cast<const float4*>(&src[gm_row * max_cols + gm_col]);
+                *reinterpret_cast<float4*>(&dst[smem_offset]) = value;
+            }
+            else{
+                #pragma unroll
+                for(int j = 0; j < 4; ++j){
+                    int col = gm_col + j;
+                    if(gm_row < max_rows && col < max_cols){
+                        dst[smem_offset + j] = src[gm_row * max_cols + col];
+                    }
+                    else{
+                        dst[smem_offset + j] = 0.0f;
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+template <int BYTES>
+__device__ __forceinline__ void cp_async_ca_shared_global(
+    float* smem_ptr,
+    const float* gmem_ptr,
+    int src_bytes
+) {
+    unsigned smem_addr;
+    asm volatile(
+        "{ .reg .u64 smem_addr_u64;\n"
+        "  cvta.to.shared.u64 smem_addr_u64, %1;\n"
+        "  cvt.u32.u64 %0, smem_addr_u64;\n"
+        "}\n"
+        : "=r"(smem_addr)
+        : "l"(smem_ptr)
+    );
+
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], %2, %3;\n"
+        :
+        : "r"(smem_addr), "l"(gmem_ptr), "n"(BYTES), "r"(src_bytes)
+    );
+}
+
+
+//辅助函数: float4向量化异步协同加载; 只发起cp.async, 需要调用方commit/wait后再读取shared memory
+template <int TROW, int TCOL, int ROW, int COL, bool direction>
+__device__ __forceinline__ void cooperative_ldst_vector_async(
+    float* dst,
+    const float* src,
+    int start_row,
+    int start_col,
+    int max_rows,
+    int max_cols
+) {
+    int flat_tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+    const int num_threads = TROW * TCOL;
+    const int vec_cols = COL / 4;
+    const int num_vec_elements = ROW * vec_cols;
+
+    for(int i = flat_tid; i < num_vec_elements; i += num_threads){
+        int smem_row = i / vec_cols;
+        int smem_vec_col = i % vec_cols;
+        int smem_col = smem_vec_col * 4;
+        int smem_offset = smem_row * COL + smem_col;
+
+        int gm_row = start_row + smem_row;
+        int gm_col = start_col + smem_col;
+
+        if(direction){
+
+        }
+        else{
+            if(gm_row < max_rows && gm_col + 3 < max_cols && gm_col % 4 == 0){//边界对齐
+                cp_async_ca_shared_global<16>(&dst[smem_offset], &src[gm_row * max_cols + gm_col], 16);
+            }
+            else{
+                #pragma unroll
+                for(int j = 0; j < 4; ++j){//处理不对齐边界
+                    int col = gm_col + j;
+                    bool valid = gm_row < max_rows && col < max_cols;
+                    const float* gmem_ptr = valid ? &src[gm_row * max_cols + col] : src;
+                    cp_async_ca_shared_global<4>(&dst[smem_offset + j], gmem_ptr, valid ? 4 : 0);
+                }
+            }
+        }
+    }
+}
+
+
+
+
 //naive, 仅确保无bank conflict, 但没有使用shared memory
 template <typename T>
 __global__ void matmul1(T* C, const T* A, const T* B, const int M, const int K, const int N){//K为共同维度, 即(M, K) @ (K, N)
@@ -178,7 +301,7 @@ __global__ void matmul3(T* C, const T* A, const T* B, const int M, const int K, 
     const int TILE_N = 32;//blockDim.x
     const int TILE_THREAD_M = 4;
     const int TILE_THREAD_N = 4;//每个thread要负责4x4窗口计算; 注意,gridDim.x = N/(TILE_N * TILE_THREAD_N), gridDim.y = M/(TILE_M * TILE_THREAD_M)
-    const int TILE_K = 8;//TILE_K不能太大，否则smem会溢出
+    const int TILE_K = 16;//TILE_K不能太大，否则smem会溢出
 
     __shared__ T A_tile [TILE_M * TILE_THREAD_M][TILE_K];
     __shared__ T B_tile [TILE_K][TILE_N * TILE_THREAD_N];
@@ -190,8 +313,10 @@ __global__ void matmul3(T* C, const T* A, const T* B, const int M, const int K, 
 
     for(int i = 0; i < K; i += TILE_K){
         //cooperative loading A_tile & B_tile
-        cooperative_ldst<T, TILE_M, TILE_N, TILE_M * TILE_THREAD_M, TILE_K, 0>((T*)A_tile, A, blockIdx.y * (TILE_M * TILE_THREAD_M), i, M, K);
-        cooperative_ldst<T, TILE_M, TILE_N, TILE_K, TILE_N * TILE_THREAD_N, 0>((T*)B_tile, B, i, blockIdx.x * (TILE_N * TILE_THREAD_N), K, N);
+        //cooperative_ldst<T, TILE_M, TILE_N, TILE_M * TILE_THREAD_M, TILE_K, 0>((T*)A_tile, A, blockIdx.y * (TILE_M * TILE_THREAD_M), i, M, K);
+        //cooperative_ldst<T, TILE_M, TILE_N, TILE_K, TILE_N * TILE_THREAD_N, 0>((T*)B_tile, B, i, blockIdx.x * (TILE_N * TILE_THREAD_N), K, N);
+        cooperative_ldst_vector<TILE_M, TILE_N, TILE_M * TILE_THREAD_M, TILE_K, 0>((float*)A_tile, A, blockIdx.y * (TILE_M * TILE_THREAD_M), i, M, K);
+        cooperative_ldst_vector<TILE_M, TILE_N, TILE_K, TILE_N * TILE_THREAD_N, 0>((float*)B_tile, B, i, blockIdx.x * (TILE_N * TILE_THREAD_N), K, N);
         __syncthreads();
 
         for(int k = 0; k < TILE_K; ++k){//原本只要进行一个数的结果计算,现在需要负责4x4的结果计算
@@ -250,6 +375,328 @@ __global__ void matmul3(T* C, const T* A, const T* B, const int M, const int K, 
     }
 
 }
+
+
+//在matmul3基础上使用cp.async和double buffering隐藏GM -> SM搬运延迟
+template <typename T>
+__global__ void matmul3_db(T* C, const T* A, const T* B, const int M, const int K, const int N){
+    int tidx = threadIdx.x;
+    int tidy = threadIdx.y;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    const int TILE_M = 8;//blockDim.y
+    const int TILE_N = 32;//blockDim.x
+    const int TILE_THREAD_M = 4;
+    const int TILE_THREAD_N = 4;//每个thread要负责4x4窗口计算; 注意,gridDim.x = N/(TILE_N * TILE_THREAD_N), gridDim.y = M/(TILE_M * TILE_THREAD_M)
+    const int TILE_K = 16;//TILE_K不能太大，否则smem会溢出
+
+    __shared__ T A_tile [2][TILE_M * TILE_THREAD_M][TILE_K];
+    __shared__ T B_tile [2][TILE_K][TILE_N * TILE_THREAD_N];
+
+    T A_reg[TILE_THREAD_M];
+    T B_reg[TILE_THREAD_N];
+    T thread_accum[TILE_THREAD_M][TILE_THREAD_N] = {T(0)};
+
+    //先等待第一块数据加载完毕
+    int curr_stage = 0;
+    cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_M * TILE_THREAD_M, TILE_K, 0>((float*)A_tile[curr_stage], A, blockIdx.y * (TILE_M * TILE_THREAD_M), 0, M, K);
+    cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_K, TILE_N * TILE_THREAD_N, 0>((float*)B_tile[curr_stage], B, 0, blockIdx.x * (TILE_N * TILE_THREAD_N), K, N);
+    asm volatile("cp.async.commit_group;\n");
+    //asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+
+    for(int i = 0; i < K; i += TILE_K){
+        curr_stage = (i / TILE_K) & 1;
+        int next_stage = curr_stage ^ 1;
+        int next_i = i + TILE_K;
+
+        //循环内,先加载下一块
+        if(next_i < K){
+            cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_M * TILE_THREAD_M, TILE_K, 0>((float*)A_tile[next_stage], A, blockIdx.y * (TILE_M * TILE_THREAD_M), next_i, M, K);
+            cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_K, TILE_N * TILE_THREAD_N, 0>((float*)B_tile[next_stage], B, next_i, blockIdx.x * (TILE_N * TILE_THREAD_N), K, N);
+            asm volatile("cp.async.commit_group;\n");
+        }
+
+        //循环内,紧接着计算本块
+        for(int k = 0; k < TILE_K; ++k){
+            for(int thread = 0; thread < TILE_THREAD_M; ++thread){
+                A_reg[thread] = A_tile[curr_stage][tidy * TILE_THREAD_M + thread][k];
+            }
+            for(int thread = 0; thread < TILE_THREAD_N; ++thread){
+                B_reg[thread] = B_tile[curr_stage][k][tidx * TILE_THREAD_N + thread];
+            }
+            for(int m = 0; m < TILE_THREAD_M; ++m){
+                for(int n = 0; n < TILE_THREAD_N; ++n){
+                    thread_accum[m][n] += A_reg[m] * B_reg[n];
+                }
+            }
+        }
+
+        if(next_i < K){
+            asm volatile("cp.async.wait_group 0;\n");
+            __syncthreads();
+        }
+    }
+
+    //vectorized write back
+    for(int m = 0; m < TILE_THREAD_M; ++m){
+        for(int n = 0; n < TILE_THREAD_N; n += 4){
+            int gm_row = blockIdx.y * (TILE_M * TILE_THREAD_M) + tidy * TILE_THREAD_M + m;
+            int gm_col = blockIdx.x * (TILE_N * TILE_THREAD_N) + tidx * TILE_THREAD_N + n;
+            int gm_offset = gm_row * N + gm_col;
+
+            if(gm_row < M && gm_col + 3 < N && gm_offset % 4 == 0){
+                float4 values = make_float4(
+                    thread_accum[m][n],
+                    thread_accum[m][n + 1],
+                    thread_accum[m][n + 2],
+                    thread_accum[m][n + 3]
+                );
+                reinterpret_cast<float4*>(C)[gm_offset / 4] = values;
+            }
+            else{
+                for(int nn = n; nn < n + 4 && nn < TILE_THREAD_N; ++nn){
+                    int scalar_gm_col = blockIdx.x * (TILE_N * TILE_THREAD_N) + tidx * TILE_THREAD_N + nn;
+                    if(gm_row < M && scalar_gm_col < N){
+                        C[gm_row * N + scalar_gm_col] = thread_accum[m][nn];
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+
+
+
+
+//在matmul3基础上使用cp.async和double buffering隐藏GM -> SM搬运延迟
+template <typename T>
+__global__ void matmul3_mb(T* C, const T* A, const T* B, const int M, const int K, const int N){
+    int tidx = threadIdx.x;
+    int tidy = threadIdx.y;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    const int TILE_M = 8;//blockDim.y
+    const int TILE_N = 32;//blockDim.x
+    const int TILE_THREAD_M = 4;
+    const int TILE_THREAD_N = 4;//每个thread要负责4x4窗口计算; 注意,gridDim.x = N/(TILE_N * TILE_THREAD_N), gridDim.y = M/(TILE_M * TILE_THREAD_M)
+    const int TILE_K = 16;//TILE_K不能太大，否则smem会溢出
+
+    __shared__ T A_tile [2][TILE_M * TILE_THREAD_M][TILE_K];
+    __shared__ T B_tile [2][TILE_K][TILE_N * TILE_THREAD_N];
+
+    T A_reg[TILE_THREAD_M];
+    T B_reg[TILE_THREAD_N];
+    T thread_accum[TILE_THREAD_M][TILE_THREAD_N] = {T(0)};
+
+    //prologue: 预加载第一块,或者N-1块对于N级流水
+    int curr_stage = 0;
+    cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_M * TILE_THREAD_M, TILE_K, 0>((float*)A_tile[curr_stage], A, blockIdx.y * (TILE_M * TILE_THREAD_M), 0, M, K);
+    cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_K, TILE_N * TILE_THREAD_N, 0>((float*)B_tile[curr_stage], B, 0, blockIdx.x * (TILE_N * TILE_THREAD_N), K, N);
+    asm volatile("cp.async.commit_group;\n");
+    //asm volatile("cp.async.wait_group 0;\n");
+    //__syncthreads();
+
+
+    //main-loop
+    for(int i = 0; i < K; i += TILE_K){
+        curr_stage = (i / TILE_K) & 1;
+        int next_stage = curr_stage ^ 1;
+        int next_i = i + TILE_K;
+
+        //循环内,先加载下一块
+        if(next_i < K){
+            cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_M * TILE_THREAD_M, TILE_K, 0>((float*)A_tile[next_stage], A, blockIdx.y * (TILE_M * TILE_THREAD_M), next_i, M, K);
+            cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_K, TILE_N * TILE_THREAD_N, 0>((float*)B_tile[next_stage], B, next_i, blockIdx.x * (TILE_N * TILE_THREAD_N), K, N);
+            asm volatile("cp.async.commit_group;\n");
+            asm volatile("cp.async.wait_group 1;\n");
+        }
+        else{//最后一块,没有下一块
+            asm volatile("cp.async.wait_group 0;\n");//必须等待之前所有group都加载完毕
+        }
+
+        __syncthreads();
+
+        //循环内,紧接着计算本块
+        for(int k = 0; k < TILE_K; ++k){
+            for(int thread = 0; thread < TILE_THREAD_M; ++thread){
+                A_reg[thread] = A_tile[curr_stage][tidy * TILE_THREAD_M + thread][k];
+            }
+            for(int thread = 0; thread < TILE_THREAD_N; ++thread){
+                B_reg[thread] = B_tile[curr_stage][k][tidx * TILE_THREAD_N + thread];
+            }
+            for(int m = 0; m < TILE_THREAD_M; ++m){
+                for(int n = 0; n < TILE_THREAD_N; ++n){
+                    thread_accum[m][n] += A_reg[m] * B_reg[n];
+                }
+            }
+        }
+
+        __syncthreads();
+        
+    }
+
+
+    //epilogue: vectorized write back
+    for(int m = 0; m < TILE_THREAD_M; ++m){
+        for(int n = 0; n < TILE_THREAD_N; n += 4){
+            int gm_row = blockIdx.y * (TILE_M * TILE_THREAD_M) + tidy * TILE_THREAD_M + m;
+            int gm_col = blockIdx.x * (TILE_N * TILE_THREAD_N) + tidx * TILE_THREAD_N + n;
+            int gm_offset = gm_row * N + gm_col;
+
+            if(gm_row < M && gm_col + 3 < N && gm_offset % 4 == 0){
+                float4 values = make_float4(
+                    thread_accum[m][n],
+                    thread_accum[m][n + 1],
+                    thread_accum[m][n + 2],
+                    thread_accum[m][n + 3]
+                );
+                reinterpret_cast<float4*>(C)[gm_offset / 4] = values;
+            }
+            else{
+                for(int nn = n; nn < n + 4 && nn < TILE_THREAD_N; ++nn){
+                    int scalar_gm_col = blockIdx.x * (TILE_N * TILE_THREAD_N) + tidx * TILE_THREAD_N + nn;
+                    if(gm_row < M && scalar_gm_col < N){
+                        C[gm_row * N + scalar_gm_col] = thread_accum[m][nn];
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+//在采用4-stage流水线进行matmul
+template <typename T>
+__global__ void matmul3_4b(T* C, const T* A, const T* B, const int M, const int K, const int N){
+    int tidx = threadIdx.x;
+    int tidy = threadIdx.y;
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    const int TILE_M = 8;//blockDim.y
+    const int TILE_N = 32;//blockDim.x
+    const int TILE_THREAD_M = 4;
+    const int TILE_THREAD_N = 4;//每个thread要负责4x4窗口计算; 注意,gridDim.x = N/(TILE_N * TILE_THREAD_N), gridDim.y = M/(TILE_M * TILE_THREAD_M)
+    const int TILE_K = 8;//TILE_K不能太大，否则smem会溢出
+    const int STAGE = 4;
+    const int TILE_NUM = (K + TILE_K - 1)/TILE_K;
+    int drain_count = STAGE - 1;
+
+    if(TILE_NUM < STAGE - 1){
+        return;//K_tile数量小于3, prologue会访存越界, 直接返回
+    }
+
+    __shared__ T A_tile [STAGE][TILE_M * TILE_THREAD_M][TILE_K];
+    __shared__ T B_tile [STAGE][TILE_K][TILE_N * TILE_THREAD_N];
+
+    T A_reg[TILE_THREAD_M];
+    T B_reg[TILE_THREAD_N];
+    T thread_accum[TILE_THREAD_M][TILE_THREAD_N] = {T(0)};
+
+    //prologue: 预加载第一块,或者前N-1块对于N级流水
+    #pragma unroll
+    for(int i = 0; i < STAGE - 1; ++i){
+        cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_M * TILE_THREAD_M, TILE_K, 0>((float*)A_tile[i], A, blockIdx.y * (TILE_M * TILE_THREAD_M), TILE_K * i, M, K);
+        cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_K, TILE_N * TILE_THREAD_N, 0>((float*)B_tile[i], B, TILE_K * i, blockIdx.x * (TILE_N * TILE_THREAD_N), K, N);
+        asm volatile("cp.async.commit_group;\n");
+    }
+
+    //main-loop
+    for(int i = 0; i < K; i += TILE_K){
+        int curr_stage = (i / TILE_K) % STAGE;
+        int next_stage = (curr_stage + STAGE - 1) % STAGE;
+        int next_i = i + TILE_K * (STAGE - 1);
+        
+        //steady mainloop
+        if(next_i < K){
+            cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_M * TILE_THREAD_M, TILE_K, 0>((float*)A_tile[next_stage], A, blockIdx.y * (TILE_M * TILE_THREAD_M), next_i, M, K);
+            cooperative_ldst_vector_async<TILE_M, TILE_N, TILE_K, TILE_N * TILE_THREAD_N, 0>((float*)B_tile[next_stage], B, next_i, blockIdx.x * (TILE_N * TILE_THREAD_N), K, N);
+            asm volatile("cp.async.commit_group;\n");
+            asm volatile("cp.async.wait_group 3;\n");
+        }
+        else{//tail drain
+            drain_count --;
+            switch(drain_count){
+                case 2: asm volatile("cp.async.wait_group 2;\n"); break;
+                case 1: asm volatile("cp.async.wait_group 1;\n"); break;
+                case 0: asm volatile("cp.async.wait_group 0;\n"); break;
+            }
+        }    
+            
+        __syncthreads();
+        for(int k = 0; k < TILE_K; ++k){
+            for(int thread = 0; thread < TILE_THREAD_M; ++thread){
+                A_reg[thread] = A_tile[curr_stage][tidy * TILE_THREAD_M + thread][k];
+            }
+            for(int thread = 0; thread < TILE_THREAD_N; ++thread){
+                B_reg[thread] = B_tile[curr_stage][k][tidx * TILE_THREAD_N + thread];
+            }
+            for(int m = 0; m < TILE_THREAD_M; ++m){
+                for(int n = 0; n < TILE_THREAD_N; ++n){
+                    thread_accum[m][n] += A_reg[m] * B_reg[n];
+                }
+            }
+        }
+        __syncthreads();
+        
+    }
+
+
+    //epilogue: vectorized write back
+    for(int m = 0; m < TILE_THREAD_M; ++m){
+        for(int n = 0; n < TILE_THREAD_N; n += 4){
+            int gm_row = blockIdx.y * (TILE_M * TILE_THREAD_M) + tidy * TILE_THREAD_M + m;
+            int gm_col = blockIdx.x * (TILE_N * TILE_THREAD_N) + tidx * TILE_THREAD_N + n;
+            int gm_offset = gm_row * N + gm_col;
+
+            if(gm_row < M && gm_col + 3 < N && gm_offset % 4 == 0){
+                float4 values = make_float4(
+                    thread_accum[m][n],
+                    thread_accum[m][n + 1],
+                    thread_accum[m][n + 2],
+                    thread_accum[m][n + 3]
+                );
+                reinterpret_cast<float4*>(C)[gm_offset / 4] = values;
+            }
+            else{
+                for(int nn = n; nn < n + 4 && nn < TILE_THREAD_N; ++nn){
+                    int scalar_gm_col = blockIdx.x * (TILE_N * TILE_THREAD_N) + tidx * TILE_THREAD_N + nn;
+                    if(gm_row < M && scalar_gm_col < N){
+                        C[gm_row * N + scalar_gm_col] = thread_accum[m][nn];
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -509,6 +956,97 @@ __global__ void matmul7(T* C, const T* A, const T* B, const int M, const int K, 
 }
 
 
+//在matmul7的warp tile布局基础上, 使用TF32 WMMA/MMA完成每个warp的32xK @ Kx16计算
+__global__ void matmul8(float* C, const float* A, const float* B, const int M, const int K, const int N){
+    const int BLOCK_THREAD_M = 8;
+    const int BLOCK_THREAD_N = 32;
+
+    const int TILE_M = 64;
+    const int TILE_N = 64;
+    const int TILE_K = 8;
+
+    const int TILE_WARP_M = 32;
+    const int TILE_WARP_N = 16;
+
+    const int WARPS_N = TILE_N / TILE_WARP_N;
+
+    __shared__ float A_tile[TILE_M][TILE_K];
+    __shared__ float B_tile[TILE_K][TILE_N];
+
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    int warp_id = tid / 32;
+
+    int warp_m = warp_id / WARPS_N;
+    int warp_n = warp_id % WARPS_N;
+
+    int warp_tile_row = warp_m * TILE_WARP_M;
+    int warp_tile_col = warp_n * TILE_WARP_N;
+
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> A_frag0;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> A_frag1;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> B_frag;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 8, float> C_frag0;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 8, float> C_frag1;
+
+    nvcuda::wmma::fill_fragment(C_frag0, 0.0f);
+    nvcuda::wmma::fill_fragment(C_frag1, 0.0f);
+
+    for(int i = 0; i < K; i += TILE_K){
+        #pragma unroll
+        for(int elem = tid; elem < TILE_M * TILE_K; elem += BLOCK_THREAD_M * BLOCK_THREAD_N){
+            int smem_row = elem / TILE_K;
+            int smem_col = elem % TILE_K;
+            int gm_row = blockIdx.y * TILE_M + smem_row;
+            int gm_col = i + smem_col;
+
+            if(gm_row < M && gm_col < K){
+                A_tile[smem_row][smem_col] = nvcuda::wmma::__float_to_tf32(A[gm_row * K + gm_col]);
+            }
+            else{
+                A_tile[smem_row][smem_col] = 0.0f;
+            }
+        }
+
+        #pragma unroll
+        for(int elem = tid; elem < TILE_K * TILE_N; elem += BLOCK_THREAD_M * BLOCK_THREAD_N){
+            int smem_row = elem / TILE_N;
+            int smem_col = elem % TILE_N;
+            int gm_row = i + smem_row;
+            int gm_col = blockIdx.x * TILE_N + smem_col;
+
+            if(gm_row < K && gm_col < N){
+                B_tile[smem_row][smem_col] = nvcuda::wmma::__float_to_tf32(B[gm_row * N + gm_col]);
+            }
+            else{
+                B_tile[smem_row][smem_col] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        nvcuda::wmma::load_matrix_sync(A_frag0, &A_tile[warp_tile_row][0], TILE_K);
+        nvcuda::wmma::load_matrix_sync(A_frag1, &A_tile[warp_tile_row + 16][0], TILE_K);
+        nvcuda::wmma::load_matrix_sync(B_frag, &B_tile[0][warp_tile_col], TILE_N);
+
+        nvcuda::wmma::mma_sync(C_frag0, A_frag0, B_frag, C_frag0);
+        nvcuda::wmma::mma_sync(C_frag1, A_frag1, B_frag, C_frag1);
+
+        __syncthreads();
+    }
+
+    int gm_row0 = blockIdx.y * TILE_M + warp_tile_row;
+    int gm_row1 = gm_row0 + 16;
+    int gm_col = blockIdx.x * TILE_N + warp_tile_col;
+
+    if(gm_row0 + 15 < M && gm_col + 15 < N){
+        nvcuda::wmma::store_matrix_sync(&C[gm_row0 * N + gm_col], C_frag0, N, nvcuda::wmma::mem_row_major);
+    }
+    if(gm_row1 + 15 < M && gm_col + 15 < N){
+        nvcuda::wmma::store_matrix_sync(&C[gm_row1 * N + gm_col], C_frag1, N, nvcuda::wmma::mem_row_major);
+    }
+}
+
+
 //按照图中的Thread Tile布局, 每个thread负责4个跳步后的4x4 C子块
 template <typename T>
 __global__ void matmul6(T* C, const T* A, const T* B, const int M, const int K, const int N){
@@ -659,7 +1197,7 @@ void matmul_cublas(float* C, const float* A, const float* B, const int M, const 
 
 
 int main(){
-    int M = 1024, K = 1024, N = 1024;
+    int M = 4096, K = 4096, N = 4096;
 
     float *h_A = new float[M * K];
     float *h_B = new float[K * N];
@@ -721,6 +1259,21 @@ int main(){
         std::cerr << "Kernel failed: " << cudaGetErrorString(err3) << std::endl;
     }
 
+    matmul3_db<float><<<grid_dim3, block_dim3>>>(d_C, d_A, d_B, M, K, N);
+    cudaDeviceSynchronize(); 
+    cudaError_t err3_db = cudaGetLastError();
+    if (err3_db != cudaSuccess) {
+        std::cerr << "Kernel failed: " << cudaGetErrorString(err3_db) << std::endl;
+    }
+
+
+    matmul3_4b<float><<<grid_dim3, block_dim3>>>(d_C, d_A, d_B, M, K, N);
+    cudaDeviceSynchronize(); 
+    cudaError_t err3_4b = cudaGetLastError();
+    if (err3_4b != cudaSuccess) {
+        std::cerr << "Kernel failed: " << cudaGetErrorString(err3_4b) << std::endl;
+    }
+
 
     /*matmul4<float><<<grid_dim3, block_dim3>>>(d_C, d_A, d_B, M, K, N);
     cudaDeviceSynchronize(); 
@@ -729,12 +1282,19 @@ int main(){
         std::cerr << "Kernel failed: " << cudaGetErrorString(err4) << std::endl;
     }*/
 
-    matmul7<float><<<grid_dim5, block_dim5>>>(d_C, d_A, d_B, M, K, N);
+    /*matmul7<float><<<grid_dim5, block_dim5>>>(d_C, d_A, d_B, M, K, N);
     cudaDeviceSynchronize(); 
-    cudaError_t err5 = cudaGetLastError();
-    if (err5 != cudaSuccess) {
-        std::cerr << "Kernel failed: " << cudaGetErrorString(err5) << std::endl;
-    }
+    cudaError_t err7 = cudaGetLastError();
+    if (err7 != cudaSuccess) {
+        std::cerr << "Kernel failed: " << cudaGetErrorString(err7) << std::endl;
+    }*/
+
+    /*matmul8<<<grid_dim5, block_dim5>>>(d_C, d_A, d_B, M, K, N);
+    cudaDeviceSynchronize(); 
+    cudaError_t err8 = cudaGetLastError();
+    if (err8 != cudaSuccess) {
+        std::cerr << "Kernel failed: " << cudaGetErrorString(err8) << std::endl;
+    }*/
 
 
     /*matmul6<float><<<grid_dim6, block_dim6>>>(d_C, d_A, d_B, M, K, N);

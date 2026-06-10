@@ -129,10 +129,12 @@ int main(){
         h_in[i] = i;
     }
 
+    //step1: device malloc
     float* d_in, *d_out;
     cudaMalloc((void**)&d_in, sizeof(float) * M * N);
     cudaMalloc((void**)&d_out, sizeof(float) * M * N);
 
+    //step2: copy H2D
     cudaMemcpy(d_in, h_in, sizeof(float) * M * N, cudaMemcpyHostToDevice);
 
     dim3 block_dim(512);//每行由1个block中的512个线程处理
@@ -142,6 +144,7 @@ int main(){
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
+    //step3: launch kernel
     softmax_2d<float><<<grid_dim, block_dim>>>(d_in, d_out, N);
     cudaDeviceSynchronize(); // 必须等待预热完成
     
@@ -153,14 +156,14 @@ int main(){
     cudaEventElapsedTime(&milliseconds1, start, stop);
     std::cout << "Naive 2D Softmax runtime: " << milliseconds1 << " ms" << std::endl;
 
-
+    //step4: copy D2H
     cudaMemcpy(h_out, d_out, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
 
     //check result
     std::cout << h_in[0] << " - " << h_in[1] << " - " << h_in[2] << " - " << h_in[3] << std::endl;
     std::cout << h_out[0] << " - " << h_out[1] << " - " << h_out[2] << " - " << h_out[3] << std::endl;
 
-
+    //step5: clean-up
     cudaFree(d_in); cudaFree(d_out);
     delete[] h_in; delete[] h_out;
 
