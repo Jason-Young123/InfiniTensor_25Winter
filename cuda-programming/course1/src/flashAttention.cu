@@ -176,7 +176,7 @@ __global__ void kernel_flashAttention(int batch_size, int target_seq_len, int sr
     }
     __syncthreads();
 
-    //step-6: O = 1/(exp(m_prev - m_new)) * O + P @ V
+    //step-6: O = (exp(m_prev - m_new)) * O + P @ V
     if(tid_x < bound_tid_x && tid_y < bound_tid_y){//32路并行计算Oi的每一行
       for(int u = tid_x; u < head_dim; u += blockDim.x){
         float val3 = 0.0;
